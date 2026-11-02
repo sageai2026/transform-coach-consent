@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Allow this coach</title>
+  <style>
+    body { margin: 0; background: #0b0b0a; color: #f3f1ec; font: 17px/1.4 -apple-system, sans-serif; }
+    main { max-width: 32rem; margin: 0 auto; padding: 32px 22px 48px; }
+    h1 { font-size: 28px; font-weight: 600; margin: 0 0 12px; }
+    p, label { color: #b7b3a8; }
+    form, section { display: flex; flex-direction: column; gap: 14px; margin-top: 22px; }
+    input[type="email"] { font: inherit; color: inherit; background: #171714; border: 0; border-radius: 16px; padding: 16px; }
+    button { font: 600 17px/1 inherit; border: 0; border-radius: 16px; padding: 16px; background: #33d678; color: #0b0b0a; }
+    button.quiet { background: transparent; color: #b7b3a8; }
+    label { display: flex; gap: 10px; align-items: center; }
+    .card { background: #171714; border-radius: 16px; padding: 16px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Allow this coach</h1>
+    <p id="status">Checking the sign-in.</p>
+    <section id="email" hidden>
+      <p>Use the same email as the app. Open the link on this device.</p>
+      <form id="link">
+        <input id="address" type="email" autocomplete="email" placeholder="Email" required>
+        <button type="submit">Send the link</button>
+      </form>
+    </section>
+    <section id="consent" hidden>
+      <div class="card" id="who"></div>
+      <label><input type="checkbox" name="scope" value="read:profile" checked> Profile</label>
+      <label><input type="checkbox" name="scope" value="read:training" checked> Program and sessions</label>
+      <label><input type="checkbox" name="scope" value="read:body" checked> Body targets, when those exist</label>
+      <label><input type="checkbox" name="scope" value="write:notes" checked> Notes</label>
+      <label><input type="checkbox" name="scope" value="write:proposals" checked> Proposals</label>
+      <label><input type="checkbox" disabled> Auto-apply stays off</label>
+      <button id="allow" type="button">Allow</button>
+      <button id="deny" class="quiet" type="button">Don’t allow</button>
+    </section>
+  </main>
+  <script type="module">
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+    const status = document.querySelector("#status")
+    const emailBox = document.querySelector("#email")
+    const consent = document.querySelector("#consent")
+    const params = new URLSearchParams(location.search)
+    const authorizationId = params.get("authorization_id")
+
+    function say(text) { status.textContent = text }
+
+    function configURL() {
+      const marker = "/c/"
+      const at = location.pathname.indexOf(marker)
+      if (at < 0) return ""
+      const token = location.pathname.slice(at + marker.length).split("/")[0]
+      if (!token) return ""
+      const padded = token.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((token.length + 3) % 4)
+      const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0))
+      return new TextDecoder().decode(bytes)
+    }
+
+    const endpoint = configURL()
+    if (!endpoint) {
+      say("This page needs a coach connection.")
+    } else {
+      const response = await fetch(endpoint, { method: "POST", headers: { accept: "application/json" } })
+      const config = response.ok ? await response.json() : null
+      if (!config?.url || !config?.key) {
+        say("Sign-in is not configured.")
+      } else {
+        const supabase = createClient(config.url, config.key, { auth: { flowType: "pkce", detectSessionInUrl: true } })
+
+        document.querySelector("#link").addEventListener("submit", async (event) => {
+          event.preventDefault()
+          const email = document.querySelector("#address").value.trim()
+          say("Sending the link")
+          const { error } = await supabase.auth.signInWithOtp({
+            email,
+            options: { emailRedirectTo: location.href, shouldCreateUser: true }
+          })
+          say(error ? "Couldn’t send the link" : "Open the link in that email on this device.")
+        })
+
+        async function signedInUser() {
+          const { data } = await supabase.auth.getUser()
+          return data.user
+        }
+
+        async function showConsent(user) {
+          if (!authorizationId) {
+            say("This page needs a coach connection.")
+            return
+          }
+          const { data, error } = await supabase.auth.oauth.getAuthorizationDetails(authorizationId)
+          if (error || !data) {
+            say(error?.message || "That request expired.")
+            return
+          }
+          if (!("authorization_id" in data)) {
+            location.href = data.redirect_url
+            return
+          }
+          document.querySelector("#who").textContent = data.client?.name || "This coach"
+          emailBox.hidden = true
+          consent.hidden = false
+          say("It can read what you allow, and it can propose. You accept a proposal in the app. Nothing applies itself.")
+          document.querySelector("#allow").onclick = () => decide(user, data, true)
+          document.querySelector("#deny").onclick = () => decide(user, data, false)
+        }
+
+        async function decide(user, details, allow) {
+          say(allow ? "Allowing" : "Stopping")
+          if (allow) {
+            const scopes = [...document.querySelectorAll("input[name=scope]:checked")].map((item) => item.value)
+            const clientId = details.client?.id || details.client?.client_id
+            const { error } = await supabase.from("mcp_grants").upsert({
+              user_id: user.id,
+              oauth_client_id: clientId,
+              scopes,
+              auto_apply_allowed: false,
+              revoked_at: null,
+              updated_at: new Date().toISOString()
+            }, { onConflict: "user_id,oauth_client_id" })
+            if (error) {
+              say("The grant was not saved.")
+              return
+            }
+            const approved = await supabase.auth.oauth.approveAuthorization(authorizationId)
+            if (approved.error || !approved.data?.redirect_url) {
+              say(approved.error?.message || "Couldn’t finish the sign-in.")
+              return
+            }
+            location.href = approved.data.redirect_url
+            return
+          }
+          const denied = await supabase.auth.oauth.denyAuthorization(authorizationId)
+          if (denied.data?.redirect_url) location.href = denied.data.redirect_url
+          else say(denied.error?.message || "Couldn’t finish.")
+        }
+
+        const user = await signedInUser()
+        if (!user) {
+          emailBox.hidden = false
+          say("Sign in with the account on the phone.")
+        } else {
+          await showConsent(user)
+        }
+      }
+    }
+  </script>
+</body>
+</html>
