@@ -10,6 +10,7 @@
     h1 { font-size: 28px; font-weight: 600; margin: 0 0 12px; }
     p, label { color: #b7b3a8; }
     form, section { display: flex; flex-direction: column; gap: 14px; margin-top: 22px; }
+    section[hidden], [hidden] { display: none !important; }
     input[type="email"] { font: inherit; color: inherit; background: #171714; border: 0; border-radius: 16px; padding: 16px; }
     button { font: 600 17px/1 inherit; border: 0; border-radius: 16px; padding: 16px; background: #33d678; color: #0b0b0a; }
     button.quiet { background: transparent; color: #b7b3a8; }
@@ -70,32 +71,73 @@
       if (!config?.url || !config?.key) {
         say("Sign-in is not configured.")
       } else {
-        const supabase = createClient(config.url, config.key, { auth: { flowType: "pkce", detectSessionInUrl: true } })
+        const supabase = createClient(config.url, config.key, { auth: { flowType: "implicit", detectSessionInUrl: true } })
+
+        function publicError(error, fallback) {
+          const raw = (error && error.message) || fallback
+          const cleaned = String(raw)
+            .replace(/https?:\/\/\S+/gi, "")
+            .replace(/\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, "")
+            .replace(/\bsb_[A-Za-z0-9_-]{8,}/g, "")
+            .replace(/\s+/g, " ")
+            .trim()
+          return cleaned || fallback
+        }
+
+        function consentReturnURL() {
+          const url = new URL(location.href)
+          url.hash = ""
+          url.search = ""
+          if (authorizationId) url.searchParams.set("authorization_id", authorizationId)
+          return url.toString()
+        }
 
         document.querySelector("#link").addEventListener("submit", async (event) => {
           event.preventDefault()
+          if (!authorizationId) {
+            say("This page needs a coach connection.")
+            return
+          }
           const email = document.querySelector("#address").value.trim()
           say("Sending the link")
           const { error } = await supabase.auth.signInWithOtp({
             email,
-            options: { emailRedirectTo: location.href, shouldCreateUser: true }
+            options: { emailRedirectTo: consentReturnURL(), shouldCreateUser: true }
           })
-          say(error ? "Couldn’t send the link" : "Open the link in that email on this device.")
+          say(error ? publicError(error, "Couldn’t send the link") : "Open the link in that email on this device.")
         })
 
-        async function signedInUser() {
-          const { data } = await supabase.auth.getUser()
-          return data.user
+        async function establishedSession() {
+          const search = new URLSearchParams(location.search)
+          const hash = new URLSearchParams(location.hash.replace(/^#/, ""))
+          const urlError = hash.get("error_description") || search.get("error_description")
+          const first = await supabase.auth.getSession()
+          if (first.data.session) {
+            const userResult = await supabase.auth.getUser()
+            if (userResult.error || !userResult.data.user) return { user: null, error: userResult.error }
+            return { user: userResult.data.user, error: null }
+          }
+          const code = search.get("code")
+          if (code) {
+            const exchanged = await supabase.auth.exchangeCodeForSession(code)
+            if (exchanged.error || !exchanged.data.session) return { user: null, error: exchanged.error }
+            const userResult = await supabase.auth.getUser()
+            if (userResult.error || !userResult.data.user) return { user: null, error: userResult.error }
+            return { user: userResult.data.user, error: null }
+          }
+          if (urlError) return { user: null, error: { message: urlError } }
+          return { user: null, error: first.error }
         }
 
         async function showConsent(user) {
+          consent.hidden = true
           if (!authorizationId) {
             say("This page needs a coach connection.")
             return
           }
           const { data, error } = await supabase.auth.oauth.getAuthorizationDetails(authorizationId)
           if (error || !data) {
-            say(error?.message || "That request expired.")
+            say(publicError(error, "That request expired."))
             return
           }
           if (!("authorization_id" in data)) {
@@ -103,11 +145,11 @@
             return
           }
           document.querySelector("#who").textContent = data.client?.name || "This coach"
+          document.querySelector("#allow").onclick = () => decide(user, data, true)
+          document.querySelector("#deny").onclick = () => decide(user, data, false)
           emailBox.hidden = true
           consent.hidden = false
           say("It can read what you allow, and it can propose. You accept a proposal in the app. Nothing applies itself.")
-          document.querySelector("#allow").onclick = () => decide(user, data, true)
-          document.querySelector("#deny").onclick = () => decide(user, data, false)
         }
 
         async function decide(user, details, allow) {
@@ -124,12 +166,12 @@
               updated_at: new Date().toISOString()
             }, { onConflict: "user_id,oauth_client_id" })
             if (error) {
-              say("The grant was not saved.")
+              say(publicError(error, "The grant was not saved."))
               return
             }
             const approved = await supabase.auth.oauth.approveAuthorization(authorizationId)
             if (approved.error || !approved.data?.redirect_url) {
-              say(approved.error?.message || "Couldn’t finish the sign-in.")
+              say(publicError(approved.error, "Couldn’t finish the sign-in."))
               return
             }
             location.href = approved.data.redirect_url
@@ -137,15 +179,16 @@
           }
           const denied = await supabase.auth.oauth.denyAuthorization(authorizationId)
           if (denied.data?.redirect_url) location.href = denied.data.redirect_url
-          else say(denied.error?.message || "Couldn’t finish.")
+          else say(publicError(denied.error, "Couldn’t finish."))
         }
 
-        const user = await signedInUser()
-        if (!user) {
+        const session = await establishedSession()
+        if (!session.user) {
           emailBox.hidden = false
-          say("Sign in with the account on the phone.")
+          consent.hidden = true
+          say(session.error ? publicError(session.error, "The sign-in link did not finish.") : "Sign in with the account on the phone.")
         } else {
-          await showConsent(user)
+          await showConsent(session.user)
         }
       }
     }
